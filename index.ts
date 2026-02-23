@@ -248,3 +248,5 @@ function generateRecommendations(
   
   return recs.sort((a, b) => b.confidence - a.confidence).slice(0, 3);
 }
+
+
