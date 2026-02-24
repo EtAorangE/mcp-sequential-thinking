@@ -155,21 +155,22 @@ interface JsonRpcResponse {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    const path = url.pathname;
+    try {
+      const url = new URL(request.url);
+      const path = url.pathname;
 
-    // CORS preflight
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-          'Access-Control-Max-Age': '86400'
-        }
-      });
-    }
+      // CORS preflight
+      if (request.method === 'OPTIONS') {
+        return new Response(null, {
+          status: 204,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+            'Access-Control-Max-Age': '86400'
+          }
+        });
+      }
 
     // OAuth 2.0 Protected Resource Metadata (RFC 9728)
     if (path === '/.well-known/oauth-protected-resource') {
@@ -252,6 +253,13 @@ export default {
     }
 
     return createErrorResponse(null, ErrorCode.METHOD_NOT_FOUND, `Path not found: ${path}`, 404);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return new Response(JSON.stringify({ error: 'internal_error', message }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
   }
 };
 
