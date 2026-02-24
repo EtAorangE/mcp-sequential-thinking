@@ -204,12 +204,25 @@ export default {
 
     // Health check (no auth required)
     if (path === '/health') {
+      // Test KV
+      let kvStatus = 'not_configured';
+      try {
+        if (env.THINKING_KV) {
+          await env.THINKING_KV.put('test:key', 'ok', { expirationTtl: 60 });
+          const val = await env.THINKING_KV.get('test:key');
+          kvStatus = val === 'ok' ? 'ok' : 'error';
+        }
+      } catch (e) {
+        kvStatus = 'error: ' + (e instanceof Error ? e.message : 'unknown');
+      }
+      
       return new Response(JSON.stringify({
         status: 'ok',
         server: SERVER_NAME,
         version: SERVER_VERSION,
         protocol: MCP_VERSION,
         auth: 'oauth-2.0',
+        kv: kvStatus,
         timestamp: new Date().toISOString()
       }), {
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
