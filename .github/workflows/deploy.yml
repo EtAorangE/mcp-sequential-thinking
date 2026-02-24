@@ -27,6 +27,7 @@ jobs:
           
           [vars]
           OAUTH_ISSUER = "https://mcp-sequential-thinking.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev"
+          JWT_SECRET = "${{ secrets.JWT_SECRET }}"
           EOF
       
       - name: Deploy to Cloudflare Workers
@@ -34,9 +35,6 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          secrets: JWT_SECRET
-        env:
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
       
       - name: Verify deployment
         run: |
