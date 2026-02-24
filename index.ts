@@ -21,7 +21,7 @@ const memoryStore = new Map<string, { value: string; expires?: number }>();
 
 async function kvGet(env: Env, key: string): Promise<string | null> {
   if (env.THINKING_KV) {
-    return await kvGet(env, key);
+    return await env.THINKING_KV.get(key);
   }
   const item = memoryStore.get(key);
   if (!item) return null;
@@ -34,7 +34,7 @@ async function kvGet(env: Env, key: string): Promise<string | null> {
 
 async function kvPut(env: Env, key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
   if (env.THINKING_KV) {
-    await kvPut(env, key, value, options);
+    await env.THINKING_KV.put(key, value, options);
     return;
   }
   memoryStore.set(key, {
@@ -45,7 +45,7 @@ async function kvPut(env: Env, key: string, value: string, options?: { expiratio
 
 async function kvDelete(env: Env, key: string): Promise<void> {
   if (env.THINKING_KV) {
-    await kvDelete(env, key);
+    await env.THINKING_KV.delete(key);
     return;
   }
   memoryStore.delete(key);
