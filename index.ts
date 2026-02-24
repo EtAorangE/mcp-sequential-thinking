@@ -272,9 +272,9 @@ function handleAuthorizationServerMetadata(env: Env): Response {
  * OAuth Dynamic Client Registration (RFC 7591)
  */
 async function handleClientRegistration(request: Request, env: Env): Promise<Response> {
-  let body;
+  let body: Record<string, any>;
   try {
-    body = await request.json();
+    body = await request.json() as Record<string, any>;
   } catch {
     return new Response(JSON.stringify({ error: 'invalid_request', error_description: 'Invalid JSON' }), {
       status: 400,
@@ -440,7 +440,6 @@ async function handleClientCredentialsGrant(body: Record<string, string>, env: E
 async function handleAuthorizationCodeGrant(body: Record<string, string>, env: Env): Promise<Response> {
   const code = body.code;
   const clientId = body.client_id;
-  const clientSecret = body.client_secret;
   const redirectUri = body.redirect_uri;
   const codeVerifier = body.code_verifier;
 
@@ -509,17 +508,9 @@ async function handleAuthorizationCodeGrant(body: Record<string, string>, env: E
  * JWKS endpoint for token verification
  */
 async function handleJWKS(env: Env): Promise<Response> {
-  // Generate a consistent key from JWT_SECRET
-  const keyData = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(env.JWT_SECRET).slice(0, 32),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-  
-  const publicKey = await crypto.subtle.exportKey('raw', keyData);
-  const n = btoa(String.fromCharCode(...new Uint8Array(publicKey)));
+  // For HMAC keys, we use the raw key bytes directly
+  const keyBytes = new TextEncoder().encode(env.JWT_SECRET).slice(0, 32);
+  const k = btoa(String.fromCharCode(...keyBytes)).replace(/=/g, '');
 
   const jwks = {
     keys: [{
@@ -527,7 +518,7 @@ async function handleJWKS(env: Env): Promise<Response> {
       kid: 'mcp-key-1',
       use: 'sig',
       alg: 'HS256',
-      k: n.replace(/=/g, '')
+      k: k
     }]
   };
 
@@ -630,7 +621,7 @@ async function verifyAuth(request: Request, env: Env): Promise<{ valid: boolean;
 /**
  * Handle SSE connection
  */
-function handleSSE(request: Request, clientId: string): Response {
+function handleSSE(request: Request, _clientId: string): Response {
   const sessionId = crypto.randomUUID();
   
   const stream = new ReadableStream({
@@ -715,7 +706,7 @@ async function handleMessages(request: Request, env: Env, clientId: string): Pro
     }
     return new Response(null, { status: 202 });
   } catch (error) {
-    let code = ErrorCode.INTERNAL_ERROR;
+    let code: number = ErrorCode.INTERNAL_ERROR;
     let message = 'Internal error';
 
     if (error instanceof McpError) {
@@ -852,7 +843,7 @@ async function handleThinking(args: any, sessionId: string, env: Env, clientId: 
 /**
  * Generate tool recommendations
  */
-function generateRecommendations(thought: string, tools: string[], thoughtNum: number, totalThoughts: number): ToolRecommendation[] {
+function generateRecommendations(thought: string, tools: string[], _thoughtNum: number, _totalThoughts: number): ToolRecommendation[] {
   if (!tools.length) return [];
 
   const thoughtLower = thought.toLowerCase();
