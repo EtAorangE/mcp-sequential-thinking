@@ -228,6 +228,14 @@ export default {
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
       });
     }
+    
+    // Debug endpoint
+    if (path === '/debug' && request.method === 'POST') {
+      const body = await request.json();
+      return new Response(JSON.stringify({ received: body }), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
 
     // SSE endpoint
     if (path === '/sse') {
