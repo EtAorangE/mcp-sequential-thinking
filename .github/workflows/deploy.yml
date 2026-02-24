@@ -21,28 +21,17 @@ jobs:
       - name: Install wrangler
         run: npm install -g wrangler
       
-      - name: Create wrangler.toml
-        run: |
-          cat > wrangler.toml << EOF
-          name = "mcp-sequential-thinking"
-          main = "index.ts"
-          compatibility_date = "2025-02-24"
-          compatibility_flags = ["nodejs_compat"]
-          
-          [[kv_namespaces]]
-          binding = "THINKING_KV"
-          id = "${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}"
-          
-          [vars]
-          OAUTH_ISSUER = "https://mcp-sequential-thinking.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev"
-          JWT_SECRET = "mcp-default-jwt-secret-2025"
-          EOF
-      
       - name: Deploy to Cloudflare Workers
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: wrangler deploy
+        run: |
+          wrangler deploy index.ts \
+            --name mcp-sequential-thinking \
+            --compatibility-date 2025-02-24 \
+            --compatibility-flag nodejs_compat \
+            --var OAUTH_ISSUER:https://mcp-sequential-thinking.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev \
+            --var JWT_SECRET:mcp-default-jwt-secret-2025
       
       - name: Verify deployment
         run: |

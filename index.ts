@@ -9,11 +9,46 @@
  */
 
 export interface Env {
-  THINKING_KV: KVNamespace;
+  THINKING_KV?: KVNamespace;
   // OAuth configuration
   OAUTH_ISSUER: string;  // e.g., https://your-worker.workers.dev
   // For JWT signing
   JWT_SECRET: string;
+}
+
+// In-memory storage fallback (for development without KV)
+const memoryStore = new Map<string, { value: string; expires?: number }>();
+
+async function kvGet(env: Env, key: string): Promise<string | null> {
+  if (env.THINKING_KV) {
+    return await kvGet(env, key);
+  }
+  const item = memoryStore.get(key);
+  if (!item) return null;
+  if (item.expires && item.expires < Date.now()) {
+    memoryStore.delete(key);
+    return null;
+  }
+  return item.value;
+}
+
+async function kvPut(env: Env, key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
+  if (env.THINKING_KV) {
+    await kvPut(env, key, value, options);
+    return;
+  }
+  memoryStore.set(key, {
+    value,
+    expires: options?.expirationTtl ? Date.now() + options.expirationTtl * 1000 : undefined
+  });
+}
+
+async function kvDelete(env: Env, key: string): Promise<void> {
+  if (env.THINKING_KV) {
+    await kvDelete(env, key);
+    return;
+  }
+  memoryStore.delete(key);
 }
 
 // Thought data structure
@@ -297,7 +332,7 @@ async function handleClientRegistration(request: Request, env: Env): Promise<Res
   };
 
   // Store client in KV
-  await env.THINKING_KV.put(`oauth:client:${clientId}`, JSON.stringify(client), { expirationTtl: 86400 * 365 });
+  await kvPut(env, `oauth:client:${clientId}`, JSON.stringify(client), { expirationTtl: 86400 * 365 });
 
   const response = {
     client_id: client.client_id,
@@ -337,7 +372,7 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
   }
 
   // Verify client exists
-  const clientData = await env.THINKING_KV.get(`oauth:client:${clientId}`);
+  const clientData = await kvGet(env, `oauth:client:${clientId}`);
   if (!clientData) {
     return new Response(JSON.stringify({ error: 'invalid_client', error_description: 'Client not found' }), {
       status: 400,
@@ -349,7 +384,7 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
   const authCode = crypto.randomUUID();
   
   // Store auth code with PKCE challenge
-  await env.THINKING_KV.put(`oauth:code:${authCode}`, JSON.stringify({
+  await kvPut(env, `oauth:code:${authCode}`, JSON.stringify({
     client_id: clientId,
     redirect_uri: redirectUri,
     scope: scope,
@@ -405,7 +440,7 @@ async function handleClientCredentialsGrant(body: Record<string, string>, env: E
   const scope = body.scope || SCOPES.join(' ');
 
   // Verify client credentials
-  const clientData = await env.THINKING_KV.get(`oauth:client:${clientId}`);
+  const clientData = await kvGet(env, `oauth:client:${clientId}`);
   if (!clientData) {
     return new Response(JSON.stringify({ error: 'invalid_client' }), {
       status: 401,
@@ -444,7 +479,7 @@ async function handleAuthorizationCodeGrant(body: Record<string, string>, env: E
   const codeVerifier = body.code_verifier;
 
   // Get stored auth code
-  const codeData = await env.THINKING_KV.get(`oauth:code:${code}`);
+  const codeData = await kvGet(env, `oauth:code:${code}`);
   if (!codeData) {
     return new Response(JSON.stringify({ error: 'invalid_grant', error_description: 'Invalid or expired authorization code' }), {
       status: 400,
@@ -489,7 +524,7 @@ async function handleAuthorizationCodeGrant(body: Record<string, string>, env: E
   }
 
   // Delete used auth code
-  await env.THINKING_KV.delete(`oauth:code:${code}`);
+  await kvDelete(env, `oauth:code:${code}`);
 
   // Generate access token
   const accessToken = await generateJWT(clientId, authCode.scope, env);
@@ -783,7 +818,7 @@ async function handleThinking(args: any, sessionId: string, env: Env, clientId: 
   const key = `thoughts:${clientId}:${sessionId}`;
   
   let thoughts: Thought[] = [];
-  const existing = await env.THINKING_KV.get(key);
+  const existing = await kvGet(env, key);
   if (existing) {
     try {
       thoughts = JSON.parse(existing);
@@ -820,7 +855,7 @@ async function handleThinking(args: any, sessionId: string, env: Env, clientId: 
   }
 
   thoughts.sort((a, b) => a.thoughtNumber - b.thoughtNumber);
-  await env.THINKING_KV.put(key, JSON.stringify(thoughts), { expirationTtl: 3600 });
+  await kvPut(env, key, JSON.stringify(thoughts), { expirationTtl: 3600 });
 
   let output = `## Thought ${args.thoughtNumber}/${adjustedTotalThoughts}`;
   if (args.isRevision) output += ' (Revision)';
