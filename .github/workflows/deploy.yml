@@ -28,6 +28,21 @@ jobs:
           [vars]
           OAUTH_ISSUER = "https://mcp-sequential-thinking.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev"
           JWT_SECRET = "${{ secrets.JWT_SECRET }}"
+          
+          [observability]
+          enabled = false
+          head_sampling_rate = 1
+          
+          [observability.logs]
+          enabled = true
+          head_sampling_rate = 1
+          persist = true
+          invocation_logs = true
+          
+          [observability.traces]
+          enabled = false
+          persist = true
+          head_sampling_rate = 1
           EOF
       
       - name: Deploy to Cloudflare Workers
