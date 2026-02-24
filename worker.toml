@@ -1,0 +1,22 @@
+name = "MCP Sequential Thinking Server"
+description = "A Model Context Protocol server with sequential thinking, OAuth authentication, and KV persistence"
+tags = ["mcp", "ai", "oauth", "cloudflare-workers"]
+
+[vars]
+OAUTH_PROVIDER = "github"
+
+# Required secrets (set after deployment):
+# - OAUTH_CLIENT_ID
+# - OAUTH_CLIENT_SECRET
+# - OAUTH_REDIRECT_URI
+# - SESSION_SECRET
+
+[[kv_namespaces]]
+binding = "THINKING_KV"
+
+[build]
+command = "npm install"
+
+[build.upload]
+format = "modules"
+main = "./index.ts"

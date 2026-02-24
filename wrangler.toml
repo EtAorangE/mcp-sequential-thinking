@@ -1,0 +1,31 @@
+name = "mcp-sequential-thinking"
+main = "index.ts"
+compatibility_date = "2025-02-24"
+compatibility_flags = ["nodejs_compat"]
+
+# KV Namespace binding for session persistence
+[[kv_namespaces]]
+binding = "THINKING_KV"
+id = "YOUR_KV_NAMESPACE_ID"  # Replace with your KV namespace ID
+
+# OAuth Configuration (set via wrangler secret or dashboard)
+# [vars]
+# OAUTH_PROVIDER = "github"  # Options: github, google, custom
+
+# Environment variables for OAuth (set via: wrangler secret put <NAME>)
+# Required secrets:
+# - OAUTH_CLIENT_ID: Your OAuth client ID
+# - OAUTH_CLIENT_SECRET: Your OAuth client secret
+# - OAUTH_REDIRECT_URI: Your redirect URI (e.g., https://your-worker.workers.dev/callback)
+
+# Development settings
+[dev]
+port = 8787
+local_protocol = "http"
+
+# Production settings
+# [env.production]
+# name = "mcp-sequential-thinking-prod"
+# [[env.production.kv_namespaces]]
+# binding = "THINKING_KV"
+# id = "YOUR_PROD_KV_NAMESPACE_ID"

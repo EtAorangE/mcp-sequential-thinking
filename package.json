@@ -1,0 +1,25 @@
+{
+  "name": "mcp-sequential-thinking",
+  "version": "1.0.0",
+  "description": "MCP Sequential Thinking Server for Cloudflare Workers with OAuth support",
+  "main": "index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "cloudflare-workers",
+    "sequential-thinking",
+    "oauth"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241127.0",
+    "typescript": "^5.7.2",
+    "wrangler": "^3.91.0"
+  }
+}

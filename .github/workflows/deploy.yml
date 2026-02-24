@@ -1,4 +1,5 @@
-name: Deploy
+name: Deploy to Cloudflare Workers
+
 on:
   push:
     branches: [main]
@@ -21,14 +22,39 @@ jobs:
           node-version: '20'
       
       - name: Install dependencies
-        run: npm install -g wrangler
+        run: |
+          npm install -g wrangler
+          npm install
+      
+      - name: Create wrangler.toml
+        run: |
+          cat > wrangler.toml << EOF
+          name = "mcp-sequential-thinking"
+          main = "index.ts"
+          compatibility_date = "2024-11-05"
+          compatibility_flags = ["nodejs_compat"]
+
+          [[kv_namespaces]]
+          binding = "THINKING_KV"
+          id = "${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}"
+          EOF
       
       - name: Deploy to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy index.ts --name mcp-sequential-thinking --compatibility-date 2024-11-01
+          secrets: |
+            OAUTH_CLIENT_ID
+            OAUTH_CLIENT_SECRET
+            OAUTH_REDIRECT_URI
+            SESSION_SECRET
+          command: deploy
+        env:
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+          OAUTH_REDIRECT_URI: ${{ secrets.OAUTH_REDIRECT_URI }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
       
       - name: Verify deployment
         run: |
