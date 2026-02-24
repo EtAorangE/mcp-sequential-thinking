@@ -1,29 +1,19 @@
 /**
- * MCP Sequential Thinking Server - Cloudflare Workers KV Edition with OAuth
+ * MCP Sequential Thinking Server - Cloudflare Workers with MCP OAuth 2.0
  * 
- * A Model Context Protocol (MCP) server implementation that provides structured,
- * step-by-step thinking for problem-solving with session persistence via Cloudflare KV.
- * Includes OAuth authentication support for secure access.
+ * Implements MCP 2025-11-25 specification with OAuth 2.0 authorization.
  * 
- * Protocol: MCP 2024-11-05
+ * Protocol: MCP 2025-11-25
  * Transport: HTTP + SSE (Server-Sent Events)
- * Runtime: Cloudflare Workers
- * Auth: OAuth 2.0 (GitHub, Google, Custom)
+ * Auth: OAuth 2.0 (RFC 9728 Protected Resource Metadata)
  */
 
 export interface Env {
   THINKING_KV: KVNamespace;
   // OAuth configuration
-  OAUTH_CLIENT_ID: string;
-  OAUTH_CLIENT_SECRET: string;
-  OAUTH_REDIRECT_URI: string;
-  OAUTH_PROVIDER?: 'github' | 'google' | 'custom';
-  // For custom OAuth provider
-  OAUTH_AUTH_URL?: string;
-  OAUTH_TOKEN_URL?: string;
-  OAUTH_USER_URL?: string;
-  // Session secret for JWT signing
-  SESSION_SECRET: string;
+  OAUTH_ISSUER: string;  // e.g., https://your-worker.workers.dev
+  // For JWT signing
+  JWT_SECRET: string;
 }
 
 // Thought data structure
@@ -39,6 +29,7 @@ interface Thought {
   needsMoreThoughts?: boolean;
   toolRecommendations?: ToolRecommendation[];
   timestamp: number;
+  sessionId: string;
 }
 
 interface ToolRecommendation {
@@ -48,86 +39,64 @@ interface ToolRecommendation {
   priority: 'high' | 'medium' | 'low';
 }
 
-// User session from OAuth
-interface UserSession {
-  userId: string;
-  username: string;
-  email?: string;
-  avatar?: string;
-  provider: string;
-  expiresAt: number;
+// OAuth client registration
+interface OAuthClient {
+  client_id: string;
+  client_secret?: string;
+  redirect_uris: string[];
+  client_name?: string;
+  grant_types: string[];
+  response_types: string[];
+  scope?: string;
+}
+
+// Access token payload
+interface AccessTokenPayload {
+  sub: string;  // client_id
+  scope: string;
+  iat: number;
+  exp: number;
 }
 
 // MCP Protocol Constants
 const MCP_VERSION = '2025-11-25';
-const SERVER_NAME = 'sequential-thinking-kv';
-const SERVER_VERSION = '1.1.0';
+const SERVER_NAME = 'sequential-thinking-oauth';
+const SERVER_VERSION = '1.0.0';
 const JSONRPC_VERSION = '2.0';
 
-// JSON-RPC Error Codes (Standard + MCP-specific)
+// OAuth scopes
+const SCOPES = ['mcp:tools', 'mcp:resources', 'mcp:prompts'];
+
+// JSON-RPC Error Codes
 const ErrorCode = {
-  // Standard JSON-RPC errors
   PARSE_ERROR: -32700,
   INVALID_REQUEST: -32600,
   METHOD_NOT_FOUND: -32601,
   INVALID_PARAMS: -32602,
   INTERNAL_ERROR: -32603,
-  // MCP-specific errors
   TOOL_NOT_FOUND: -32000,
   INVALID_TOOL_INPUT: -32005,
-  SESSION_NOT_FOUND: -32006,
   UNAUTHORIZED: -32001,
 } as const;
 
-// Tool definitions following MCP specification
+// Tool definitions
 const TOOLS = [
   {
     name: 'sequentialthinking',
-    description: 'Facilitates a detailed, step-by-step thinking process for problem-solving and analysis. Supports revision, branching, and dynamic adjustment of thought count.',
+    description: 'Facilitates a detailed, step-by-step thinking process for problem-solving and analysis.',
     inputSchema: {
       type: 'object',
       properties: {
-        thought: { 
-          type: 'string',
-          description: 'The current thinking step content'
-        },
-        nextThoughtNeeded: { 
-          type: 'boolean',
-          description: 'Whether another thought step is needed'
-        },
-        thoughtNumber: { 
-          type: 'number',
-          description: 'Current thought number (1-indexed)'
-        },
-        totalThoughts: { 
-          type: 'number',
-          description: 'Estimated total thoughts needed'
-        },
-        available_mcp_tools: { 
-          type: 'array', 
-          items: { type: 'string' },
-          description: 'List of available MCP tool names for recommendations'
-        },
-        isRevision: { 
-          type: 'boolean',
-          description: 'Whether this revises previous thinking'
-        },
-        revisesThought: { 
-          type: 'number',
-          description: 'Which thought number is being reconsidered (required if isRevision is true)'
-        },
-        branchFromThought: { 
-          type: 'number',
-          description: 'Branching point thought number'
-        },
-        branchId: { 
-          type: 'string',
-          description: 'Branch identifier string'
-        },
-        needsMoreThoughts: { 
-          type: 'boolean',
-          description: 'If more thoughts are needed beyond current estimate'
-        }
+        thought: { type: 'string', description: 'The current thinking step content' },
+        nextThoughtNeeded: { type: 'boolean', description: 'Whether another thought step is needed' },
+        thoughtNumber: { type: 'number', description: 'Current thought number (1-indexed)' },
+        totalThoughts: { type: 'number', description: 'Estimated total thoughts needed' },
+        available_mcp_tools: { type: 'array', items: { type: 'string' }, description: 'List of available MCP tool names' },
+        isRevision: { type: 'boolean', description: 'Whether this revises previous thinking' },
+        revisesThought: { type: 'number', description: 'Which thought number is being reconsidered' },
+        branchFromThought: { type: 'number', description: 'Branching point thought number' },
+        branchId: { type: 'string', description: 'Branch identifier string' },
+        needsMoreThoughts: { type: 'boolean', description: 'If more thoughts are needed beyond current estimate' }
       },
       required: ['thought', 'nextThoughtNeeded', 'thoughtNumber', 'totalThoughts', 'available_mcp_tools'],
       additionalProperties: false
@@ -135,7 +104,6 @@ const TOOLS = [
   }
 ];
 
-// JSON-RPC Request/Response types
 interface JsonRpcRequest {
   jsonrpc: string;
   id?: string | number | null;
@@ -147,251 +115,443 @@ interface JsonRpcResponse {
   jsonrpc: string;
   id?: string | number | null;
   result?: any;
-  error?: {
-    code: number;
-    message: string;
-    data?: any;
-  };
+  error?: { code: number; message: string; data?: any; };
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const path = url.pathname;
 
-    // Handle CORS preflight
+    // CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
         headers: {
           'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, Authorization',
           'Access-Control-Max-Age': '86400'
         }
       });
     }
 
-    // OAuth routes
-    if (url.pathname === '/auth/login') {
-      return handleOAuthLogin(request, env);
+    // OAuth 2.0 Protected Resource Metadata (RFC 9728)
+    if (path === '/.well-known/oauth-protected-resource') {
+      return handleProtectedResourceMetadata(env);
     }
 
-    if (url.pathname === '/auth/callback') {
-      return handleOAuthCallback(request, env);
+    // OAuth 2.0 Authorization Server Metadata
+    if (path === '/.well-known/oauth-authorization-server') {
+      return handleAuthorizationServerMetadata(env);
     }
 
-    if (url.pathname === '/auth/logout') {
-      return handleLogout(request, env);
+    // OAuth Dynamic Client Registration (RFC 7591)
+    if (path === '/oauth/register' && request.method === 'POST') {
+      return handleClientRegistration(request, env);
     }
 
-    if (url.pathname === '/auth/me') {
-      return handleAuthMe(request, env);
+    // OAuth Authorize endpoint
+    if (path === '/oauth/authorize' && request.method === 'GET') {
+      return handleAuthorize(request, env);
     }
 
-    // SSE endpoint for session establishment
-    if (url.pathname === '/sse') {
-      const authResult = await checkAuth(request, env);
-      if (!authResult.authorized) {
-        return createErrorResponse(null, ErrorCode.UNAUTHORIZED, authResult.error || 'Unauthorized', 401);
-      }
-      return handleSSE(request, authResult.user!);
+    // OAuth Token endpoint
+    if (path === '/oauth/token' && request.method === 'POST') {
+      return handleToken(request, env);
     }
 
-    // JSON-RPC message endpoint
-    if (url.pathname === '/messages') {
-      const authResult = await checkAuth(request, env);
-      if (!authResult.authorized) {
-        return createErrorResponse(null, ErrorCode.UNAUTHORIZED, authResult.error || 'Unauthorized', 401);
-      }
-      return handleMessages(request, env, authResult.user!);
+    // OAuth JWK Set for token verification
+    if (path === '/oauth/jwks') {
+      return handleJWKS(env);
     }
 
-    // Health check endpoint (no auth required)
-    if (url.pathname === '/health') {
-      return new Response(
-        JSON.stringify({ 
-          status: 'ok', 
-          server: SERVER_NAME,
-          version: SERVER_VERSION,
-          protocol: MCP_VERSION,
-          auth: 'oauth-enabled',
-          timestamp: new Date().toISOString()
-        }), 
-        {
-          status: 200,
+    // Health check (no auth required)
+    if (path === '/health') {
+      return new Response(JSON.stringify({
+        status: 'ok',
+        server: SERVER_NAME,
+        version: SERVER_VERSION,
+        protocol: MCP_VERSION,
+        auth: 'oauth-2.0',
+        timestamp: new Date().toISOString()
+      }), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    // SSE endpoint
+    if (path === '/sse') {
+      const authResult = await verifyAuth(request, env);
+      if (!authResult.valid) {
+        return new Response(JSON.stringify({ error: 'unauthorized', error_description: authResult.error }), {
+          status: 401,
           headers: { 
             'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*'
+            'WWW-Authenticate': 'Bearer error="invalid_token"'
           }
-        }
-      );
+        });
+      }
+      return handleSSE(request, authResult.clientId!);
     }
 
-    // Root endpoint - show auth status
-    if (url.pathname === '/') {
-      return handleRoot(request, env);
+    // JSON-RPC messages endpoint
+    if (path === '/messages') {
+      const authResult = await verifyAuth(request, env);
+      if (!authResult.valid) {
+        return createErrorResponse(null, ErrorCode.UNAUTHORIZED, authResult.error || 'Unauthorized', 401);
+      }
+      return handleMessages(request, env, authResult.clientId!);
     }
 
-    // 404 for unknown paths
-    return createErrorResponse(null, ErrorCode.METHOD_NOT_FOUND, `Path not found: ${url.pathname}`, 404);
+    // Root - show info
+    if (path === '/') {
+      return new Response(JSON.stringify({
+        name: SERVER_NAME,
+        version: SERVER_VERSION,
+        protocol: MCP_VERSION,
+        authorization: `${env.OAUTH_ISSUER}/.well-known/oauth-protected-resource`
+      }), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    return createErrorResponse(null, ErrorCode.METHOD_NOT_FOUND, `Path not found: ${path}`, 404);
   }
 };
 
 /**
- * Handle root endpoint - show auth status and login link
+ * OAuth 2.0 Protected Resource Metadata (RFC 9728)
  */
-async function handleRoot(request: Request, env: Env): Promise<Response> {
-  const authResult = await checkAuth(request, env);
-  const provider = env.OAUTH_PROVIDER || 'github';
+function handleProtectedResourceMetadata(env: Env): Response {
+  const metadata = {
+    resource: env.OAUTH_ISSUER,
+    authorization_servers: [env.OAUTH_ISSUER],
+    scopes_supported: SCOPES,
+    bearer_methods_supported: ['header'],
+    resource_documentation: `${env.OAUTH_ISSUER}/health`
+  };
   
-  let html = `<!DOCTYPE html>
-<html>
-<head>
-  <title>MCP Sequential Thinking Server</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
-    .card { background: #f6f8fa; border-radius: 8px; padding: 20px; margin: 20px 0; }
-    .btn { display: inline-block; padding: 10px 20px; background: #0366d6; color: white; text-decoration: none; border-radius: 6px; }
-    .btn:hover { background: #0256c5; }
-    pre { background: #1f2937; color: #e5e7eb; padding: 15px; border-radius: 6px; overflow-x: auto; }
-    code { font-family: 'Menlo', 'Monaco', monospace; }
-  </style>
-</head>
-<body>
-  <h1>🧠 MCP Sequential Thinking Server</h1>
-  <div class="card">
-    <p><strong>Version:</strong> ${SERVER_VERSION}</p>
-    <p><strong>Protocol:</strong> MCP ${MCP_VERSION}</p>
-    <p><strong>Auth:</strong> OAuth 2.0 (${provider})</p>
-  </div>`;
-
-  if (authResult.authorized && authResult.user) {
-    html += `
-  <div class="card">
-    <h2>✅ Authenticated</h2>
-    <p><strong>User:</strong> ${authResult.user.username}</p>
-    ${authResult.user.email ? `<p><strong>Email:</strong> ${authResult.user.email}</p>` : ''}
-    <p><a href="/auth/logout" class="btn" style="background: #dc3545;">Logout</a></p>
-  </div>
-  <div class="card">
-    <h3>Endpoints</h3>
-    <pre><code>SSE:      /sse
-Messages: /messages
-Health:   /health</code></pre>
-  </div>`;
-  } else {
-    html += `
-  <div class="card">
-    <h2>🔐 Authentication Required</h2>
-    <p>Please authenticate to access the MCP server.</p>
-    <p><a href="/auth/login" class="btn">Login with ${provider.charAt(0).toUpperCase() + provider.slice(1)}</a></p>
-  </div>`;
-  }
-
-  html += `
-</body>
-</html>`;
-
-  return new Response(html, {
-    headers: { 'Content-Type': 'text/html; charset=utf-8' }
+  return new Response(JSON.stringify(metadata), {
+    headers: { 
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*'
+    }
   });
 }
 
 /**
- * Check authentication from cookie or Authorization header
+ * OAuth 2.0 Authorization Server Metadata
  */
-async function checkAuth(request: Request, env: Env): Promise<{ authorized: boolean; user?: UserSession; error?: string }> {
-  // Check Authorization header first (Bearer token)
-  const authHeader = request.headers.get('Authorization');
-  if (authHeader?.startsWith('Bearer ')) {
-    const token = authHeader.slice(7);
-    return verifySessionToken(token, env);
-  }
-
-  // Check cookie
-  const cookie = request.headers.get('Cookie');
-  if (cookie) {
-    const match = cookie.match(/mcp_session=([^;]+)/);
-    if (match) {
-      return verifySessionToken(match[1], env);
+function handleAuthorizationServerMetadata(env: Env): Response {
+  const metadata = {
+    issuer: env.OAUTH_ISSUER,
+    authorization_endpoint: `${env.OAUTH_ISSUER}/oauth/authorize`,
+    token_endpoint: `${env.OAUTH_ISSUER}/oauth/token`,
+    registration_endpoint: `${env.OAUTH_ISSUER}/oauth/register`,
+    jwks_uri: `${env.OAUTH_ISSUER}/oauth/jwks`,
+    response_types_supported: ['code'],
+    response_modes_supported: ['query'],
+    grant_types_supported: ['authorization_code', 'client_credentials'],
+    code_challenge_methods_supported: ['S256'],
+    scopes_supported: SCOPES,
+    token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
+    introspection_endpoint: `${env.OAUTH_ISSUER}/oauth/introspect`,
+    revocation_endpoint: `${env.OAUTH_ISSUER}/oauth/revoke`
+  };
+  
+  return new Response(JSON.stringify(metadata), {
+    headers: { 
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*'
     }
-  }
-
-  return { authorized: false, error: 'No authentication credentials provided' };
+  });
 }
 
 /**
- * Verify session token (JWT-like)
+ * OAuth Dynamic Client Registration (RFC 7591)
  */
-async function verifySessionToken(token: string, env: Env): Promise<{ authorized: boolean; user?: UserSession; error?: string }> {
+async function handleClientRegistration(request: Request, env: Env): Promise<Response> {
+  let body;
   try {
-    const parts = token.split('.');
-    if (parts.length !== 3) {
-      return { authorized: false, error: 'Invalid token format' };
-    }
-
-    const [headerB64, payloadB64, signatureB64] = parts;
-    
-    // Verify signature
-    const encoder = new TextEncoder();
-    const key = await crypto.subtle.importKey(
-      'raw',
-      encoder.encode(env.SESSION_SECRET),
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['verify']
-    );
-
-    const signature = Uint8Array.from(atob(signatureB64.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
-    const data = encoder.encode(`${headerB64}.${payloadB64}`);
-    
-    const valid = await crypto.subtle.verify('HMAC', key, signature, data);
-    if (!valid) {
-      return { authorized: false, error: 'Invalid token signature' };
-    }
-
-    // Decode payload
-    const payload = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')));
-    
-    // Check expiration
-    if (payload.exp && payload.exp < Date.now() / 1000) {
-      return { authorized: false, error: 'Token expired' };
-    }
-
-    return { 
-      authorized: true, 
-      user: {
-        userId: payload.sub,
-        username: payload.username,
-        email: payload.email,
-        avatar: payload.avatar,
-        provider: payload.provider,
-        expiresAt: payload.exp * 1000
-      }
-    };
-  } catch (error) {
-    return { authorized: false, error: 'Token verification failed' };
+    body = await request.json();
+  } catch {
+    return new Response(JSON.stringify({ error: 'invalid_request', error_description: 'Invalid JSON' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
+
+  // Generate client credentials
+  const clientId = crypto.randomUUID();
+  const clientSecret = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
+  
+  const client: OAuthClient = {
+    client_id: clientId,
+    client_secret: clientSecret,
+    redirect_uris: body.redirect_uris || [],
+    client_name: body.client_name || 'MCP Client',
+    grant_types: body.grant_types || ['authorization_code', 'client_credentials'],
+    response_types: body.response_types || ['code'],
+    scope: body.scope || SCOPES.join(' ')
+  };
+
+  // Store client in KV
+  await env.THINKING_KV.put(`oauth:client:${clientId}`, JSON.stringify(client), { expirationTtl: 86400 * 365 });
+
+  const response = {
+    client_id: client.client_id,
+    client_secret: client.client_secret,
+    client_id_issued_at: Math.floor(Date.now() / 1000),
+    client_secret_expires_at: 0, // Never expires
+    redirect_uris: client.redirect_uris,
+    client_name: client.client_name,
+    grant_types: client.grant_types,
+    response_types: client.response_types,
+    scope: client.scope
+  };
+
+  return new Response(JSON.stringify(response), {
+    status: 201,
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+  });
 }
 
 /**
- * Create session token
+ * OAuth Authorize endpoint - for user consent flow
  */
-async function createSessionToken(user: UserSession, env: Env): Promise<string> {
+async function handleAuthorize(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const clientId = url.searchParams.get('client_id');
+  const redirectUri = url.searchParams.get('redirect_uri');
+  const scope = url.searchParams.get('scope') || '';
+  const state = url.searchParams.get('state') || '';
+  const codeChallenge = url.searchParams.get('code_challenge');
+  const codeChallengeMethod = url.searchParams.get('code_challenge_method') || 'S256';
+
+  if (!clientId || !redirectUri) {
+    return new Response(JSON.stringify({ error: 'invalid_request', error_description: 'Missing required parameters' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  // Verify client exists
+  const clientData = await env.THINKING_KV.get(`oauth:client:${clientId}`);
+  if (!clientData) {
+    return new Response(JSON.stringify({ error: 'invalid_client', error_description: 'Client not found' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  // For automated clients, auto-approve and redirect with code
+  const authCode = crypto.randomUUID();
+  
+  // Store auth code with PKCE challenge
+  await env.THINKING_KV.put(`oauth:code:${authCode}`, JSON.stringify({
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    scope: scope,
+    code_challenge: codeChallenge,
+    code_challenge_method: codeChallengeMethod,
+    expires_at: Date.now() + 60000 // 1 minute
+  }), { expirationTtl: 60 });
+
+  const redirectUrl = new URL(redirectUri);
+  redirectUrl.searchParams.set('code', authCode);
+  if (state) redirectUrl.searchParams.set('state', state);
+
+  return new Response(null, {
+    status: 302,
+    headers: { Location: redirectUrl.toString() }
+  });
+}
+
+/**
+ * OAuth Token endpoint
+ */
+async function handleToken(request: Request, env: Env): Promise<Response> {
+  const contentType = request.headers.get('Content-Type') || '';
+  let body: Record<string, string>;
+
+  if (contentType.includes('application/x-www-form-urlencoded')) {
+    const text = await request.text();
+    body = Object.fromEntries(new URLSearchParams(text));
+  } else {
+    body = await request.json();
+  }
+
+  const grantType = body.grant_type;
+
+  if (grantType === 'client_credentials') {
+    return handleClientCredentialsGrant(body, env);
+  } else if (grantType === 'authorization_code') {
+    return handleAuthorizationCodeGrant(body, env);
+  }
+
+  return new Response(JSON.stringify({ error: 'unsupported_grant_type', error_description: `Grant type ${grantType} not supported` }), {
+    status: 400,
+    headers: { 'Content-Type': 'application/json' }
+  });
+}
+
+/**
+ * Client Credentials Grant
+ */
+async function handleClientCredentialsGrant(body: Record<string, string>, env: Env): Promise<Response> {
+  const clientId = body.client_id;
+  const clientSecret = body.client_secret;
+  const scope = body.scope || SCOPES.join(' ');
+
+  // Verify client credentials
+  const clientData = await env.THINKING_KV.get(`oauth:client:${clientId}`);
+  if (!clientData) {
+    return new Response(JSON.stringify({ error: 'invalid_client' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  const client = JSON.parse(clientData) as OAuthClient;
+  if (client.client_secret !== clientSecret) {
+    return new Response(JSON.stringify({ error: 'invalid_client' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  // Generate access token
+  const accessToken = await generateJWT(clientId, scope, env);
+
+  return new Response(JSON.stringify({
+    access_token: accessToken,
+    token_type: 'Bearer',
+    expires_in: 3600,
+    scope: scope
+  }), {
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+  });
+}
+
+/**
+ * Authorization Code Grant
+ */
+async function handleAuthorizationCodeGrant(body: Record<string, string>, env: Env): Promise<Response> {
+  const code = body.code;
+  const clientId = body.client_id;
+  const clientSecret = body.client_secret;
+  const redirectUri = body.redirect_uri;
+  const codeVerifier = body.code_verifier;
+
+  // Get stored auth code
+  const codeData = await env.THINKING_KV.get(`oauth:code:${code}`);
+  if (!codeData) {
+    return new Response(JSON.stringify({ error: 'invalid_grant', error_description: 'Invalid or expired authorization code' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  const authCode = JSON.parse(codeData);
+
+  // Verify client
+  if (authCode.client_id !== clientId) {
+    return new Response(JSON.stringify({ error: 'invalid_client' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  // Verify redirect URI
+  if (authCode.redirect_uri !== redirectUri) {
+    return new Response(JSON.stringify({ error: 'invalid_grant', error_description: 'Redirect URI mismatch' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  // Verify PKCE code verifier
+  if (authCode.code_challenge) {
+    const encoder = new TextEncoder();
+    const verifierData = encoder.encode(codeVerifier);
+    const hash = await crypto.subtle.digest('SHA-256', verifierData);
+    const hashBase64 = btoa(String.fromCharCode(...new Uint8Array(hash)))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=/g, '');
+    
+    if (hashBase64 !== authCode.code_challenge) {
+      return new Response(JSON.stringify({ error: 'invalid_grant', error_description: 'PKCE verification failed' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  // Delete used auth code
+  await env.THINKING_KV.delete(`oauth:code:${code}`);
+
+  // Generate access token
+  const accessToken = await generateJWT(clientId, authCode.scope, env);
+
+  return new Response(JSON.stringify({
+    access_token: accessToken,
+    token_type: 'Bearer',
+    expires_in: 3600,
+    scope: authCode.scope
+  }), {
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+  });
+}
+
+/**
+ * JWKS endpoint for token verification
+ */
+async function handleJWKS(env: Env): Promise<Response> {
+  // Generate a consistent key from JWT_SECRET
+  const keyData = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(env.JWT_SECRET).slice(0, 32),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  
+  const publicKey = await crypto.subtle.exportKey('raw', keyData);
+  const n = btoa(String.fromCharCode(...new Uint8Array(publicKey)));
+
+  const jwks = {
+    keys: [{
+      kty: 'oct',
+      kid: 'mcp-key-1',
+      use: 'sig',
+      alg: 'HS256',
+      k: n.replace(/=/g, '')
+    }]
+  };
+
+  return new Response(JSON.stringify(jwks), {
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+  });
+}
+
+/**
+ * Generate JWT access token
+ */
+async function generateJWT(clientId: string, scope: string, env: Env): Promise<string> {
   const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).replace(/=/g, '');
   const payload = btoa(JSON.stringify({
-    sub: user.userId,
-    username: user.username,
-    email: user.email,
-    avatar: user.avatar,
-    provider: user.provider,
-    exp: Math.floor(user.expiresAt / 1000)
+    sub: clientId,
+    scope: scope,
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 3600
   })).replace(/=/g, '');
 
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
     'raw',
-    encoder.encode(env.SESSION_SECRET),
+    encoder.encode(env.JWT_SECRET).slice(0, 32),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign']
@@ -404,238 +564,88 @@ async function createSessionToken(user: UserSession, env: Env): Promise<string> 
 }
 
 /**
- * Handle OAuth login initiation
+ * Verify JWT access token
  */
-function handleOAuthLogin(_request: Request, env: Env): Response {
-  const provider = env.OAUTH_PROVIDER || 'github';
-  const state = crypto.randomUUID();
-  
-  let authUrl: string;
-  let clientId = env.OAUTH_CLIENT_ID;
-  let redirectUri = encodeURIComponent(env.OAUTH_REDIRECT_URI);
-
-  switch (provider) {
-    case 'github':
-      authUrl = `https://github.com/login/oauth/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&scope=user:email&state=${state}`;
-      break;
-    case 'google':
-      authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=openid%20email%20profile&state=${state}`;
-      break;
-    case 'custom':
-      if (!env.OAUTH_AUTH_URL) {
-        return new Response('Custom OAuth provider requires OAUTH_AUTH_URL', { status: 500 });
-      }
-      authUrl = `${env.OAUTH_AUTH_URL}?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&state=${state}`;
-      break;
-    default:
-      return new Response(`Unsupported OAuth provider: ${provider}`, { status: 500 });
-  }
-
-  // Store state in cookie for verification
-  return new Response(null, {
-    status: 302,
-    headers: {
-      'Location': authUrl,
-      'Set-Cookie': `oauth_state=${state}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`
-    }
-  });
-}
-
-/**
- * Handle OAuth callback
- */
-async function handleOAuthCallback(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url);
-  const code = url.searchParams.get('code');
-  const state = url.searchParams.get('state');
-  
-  // Verify state
-  const cookie = request.headers.get('Cookie') || '';
-  const stateMatch = cookie.match(/oauth_state=([^;]+)/);
-  if (!stateMatch || stateMatch[1] !== state) {
-    return new Response('Invalid OAuth state', { status: 400 });
-  }
-
-  if (!code) {
-    return new Response('No authorization code provided', { status: 400 });
-  }
-
-  const provider = env.OAUTH_PROVIDER || 'github';
-
+async function verifyJWT(token: string, env: Env): Promise<{ valid: boolean; payload?: AccessTokenPayload; error?: string }> {
   try {
-    // Exchange code for token
-    let tokenUrl: string;
-    let tokenBody: string;
-
-    switch (provider) {
-      case 'github':
-        tokenUrl = 'https://github.com/login/oauth/access_token';
-        tokenBody = `client_id=${env.OAUTH_CLIENT_ID}&client_secret=${env.OAUTH_CLIENT_SECRET}&code=${code}&redirect_uri=${encodeURIComponent(env.OAUTH_REDIRECT_URI)}`;
-        break;
-      case 'google':
-        tokenUrl = 'https://oauth2.googleapis.com/token';
-        tokenBody = `client_id=${env.OAUTH_CLIENT_ID}&client_secret=${env.OAUTH_CLIENT_SECRET}&code=${code}&redirect_uri=${encodeURIComponent(env.OAUTH_REDIRECT_URI)}&grant_type=authorization_code`;
-        break;
-      case 'custom':
-        tokenUrl = env.OAUTH_TOKEN_URL!;
-        tokenBody = `client_id=${env.OAUTH_CLIENT_ID}&client_secret=${env.OAUTH_CLIENT_SECRET}&code=${code}&redirect_uri=${encodeURIComponent(env.OAUTH_REDIRECT_URI)}&grant_type=authorization_code`;
-        break;
-      default:
-        throw new Error(`Unsupported provider: ${provider}`);
+    const parts = token.split('.');
+    if (parts.length !== 3) {
+      return { valid: false, error: 'Invalid token format' };
     }
 
-    const tokenResponse = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json'
-      },
-      body: tokenBody
-    });
-
-    const tokenData = await tokenResponse.json() as { error?: string; error_description?: string; access_token?: string };
+    const [headerB64, payloadB64, signatureB64] = parts;
     
-    if (tokenData.error) {
-      throw new Error(tokenData.error_description || tokenData.error);
-    }
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      'raw',
+      encoder.encode(env.JWT_SECRET).slice(0, 32),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['verify']
+    );
 
-    const accessToken = tokenData.access_token;
-
-    // Fetch user info
-    let userUrl: string;
-    let authHeader: string;
-
-    switch (provider) {
-      case 'github':
-        userUrl = 'https://api.github.com/user';
-        authHeader = `token ${accessToken}`;
-        break;
-      case 'google':
-        userUrl = 'https://www.googleapis.com/oauth2/v2/userinfo';
-        authHeader = `Bearer ${accessToken}`;
-        break;
-      case 'custom':
-        userUrl = env.OAUTH_USER_URL!;
-        authHeader = `Bearer ${accessToken}`;
-        break;
-      default:
-        throw new Error(`Unsupported provider: ${provider}`);
-    }
-
-    const userResponse = await fetch(userUrl, {
-      headers: { 'Authorization': authHeader }
-    });
-
-    const userData = await userResponse.json() as Record<string, any>;
-
-    // Create user session
-    let user: UserSession;
+    const signature = Uint8Array.from(atob(signatureB64.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+    const data = encoder.encode(`${headerB64}.${payloadB64}`);
     
-    switch (provider) {
-      case 'github':
-        user = {
-          userId: String(userData.id),
-          username: userData.login,
-          email: userData.email,
-          avatar: userData.avatar_url,
-          provider: 'github',
-          expiresAt: Date.now() + 24 * 60 * 60 * 1000 // 24 hours
-        };
-        break;
-      case 'google':
-        user = {
-          userId: userData.id,
-          username: userData.name || userData.email,
-          email: userData.email,
-          avatar: userData.picture,
-          provider: 'google',
-          expiresAt: Date.now() + 24 * 60 * 60 * 1000
-        };
-        break;
-      default:
-        user = {
-          userId: userData.id || userData.sub,
-          username: userData.username || userData.name || userData.email,
-          email: userData.email,
-          avatar: userData.avatar || userData.picture,
-          provider: 'custom',
-          expiresAt: Date.now() + 24 * 60 * 60 * 1000
-        };
+    const valid = await crypto.subtle.verify('HMAC', key, signature, data);
+    if (!valid) {
+      return { valid: false, error: 'Invalid signature' };
     }
 
-    // Create session token
-    const sessionToken = await createSessionToken(user, env);
+    const payload = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/'))) as AccessTokenPayload;
+    
+    if (payload.exp < Math.floor(Date.now() / 1000)) {
+      return { valid: false, error: 'Token expired' };
+    }
 
-    // Redirect to home with session cookie
-    return new Response(null, {
-      status: 302,
-      headers: {
-        'Location': '/',
-        'Set-Cookie': `mcp_session=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400`
-      }
-    });
-
+    return { valid: true, payload };
   } catch (error) {
-    console.error('OAuth callback error:', error);
-    return new Response(`Authentication failed: ${error instanceof Error ? error.message : 'Unknown error'}`, { status: 500 });
+    return { valid: false, error: 'Token verification failed' };
   }
 }
 
 /**
- * Handle logout
+ * Verify Authorization header
  */
-function handleLogout(_request: Request, _env: Env): Response {
-  return new Response(null, {
-    status: 302,
-    headers: {
-      'Location': '/',
-      'Set-Cookie': 'mcp_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0'
-    }
-  });
+async function verifyAuth(request: Request, env: Env): Promise<{ valid: boolean; clientId?: string; error?: string }> {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader) {
+    return { valid: false, error: 'Missing Authorization header' };
+  }
+
+  if (!authHeader.startsWith('Bearer ')) {
+    return { valid: false, error: 'Invalid Authorization header format' };
+  }
+
+  const token = authHeader.slice(7);
+  const result = await verifyJWT(token, env);
+
+  if (!result.valid) {
+    return { valid: false, error: result.error };
+  }
+
+  return { valid: true, clientId: result.payload!.sub };
 }
 
 /**
- * Handle auth me endpoint
+ * Handle SSE connection
  */
-async function handleAuthMe(request: Request, env: Env): Promise<Response> {
-  const authResult = await checkAuth(request, env);
-  
-  return new Response(JSON.stringify({
-    authenticated: authResult.authorized,
-    user: authResult.user || null,
-    error: authResult.error || null
-  }), {
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*'
-    }
-  });
-}
-
-/**
- * Handle SSE connection establishment
- * Returns endpoint URL for client to connect via POST
- */
-function handleSSE(request: Request, user: UserSession): Response {
+function handleSSE(request: Request, clientId: string): Response {
   const sessionId = crypto.randomUUID();
   
   const stream = new ReadableStream({
     start(controller) {
-      // Send initial endpoint event
-      const endpointMsg = `event: endpoint\ndata: /messages?sessionId=${sessionId}&userId=${user.userId}\n\n`;
+      const endpointMsg = `event: endpoint\ndata: /messages?sessionId=${sessionId}\n\n`;
       controller.enqueue(new TextEncoder().encode(endpointMsg));
       
-      // Send keepalive every 30 seconds to prevent connection timeout
       const keepaliveInterval = setInterval(() => {
         try {
-          const keepalive = `event: ping\ndata: {}\n\n`;
-          controller.enqueue(new TextEncoder().encode(keepalive));
+          controller.enqueue(new TextEncoder().encode(`event: ping\ndata: {}\n\n`));
         } catch {
           clearInterval(keepaliveInterval);
         }
       }, 30000);
 
-      // Cleanup on close
       request.signal.addEventListener('abort', () => {
         clearInterval(keepaliveInterval);
         controller.close();
@@ -656,26 +666,24 @@ function handleSSE(request: Request, user: UserSession): Response {
 /**
  * Handle JSON-RPC messages
  */
-async function handleMessages(request: Request, env: Env, user: UserSession): Promise<Response> {
-  // Only accept POST requests for JSON-RPC
+async function handleMessages(request: Request, env: Env, clientId: string): Promise<Response> {
   if (request.method !== 'POST') {
-    return createErrorResponse(null, ErrorCode.INVALID_REQUEST, 'Only POST method is allowed for JSON-RPC messages', 405);
+    return createErrorResponse(null, ErrorCode.INVALID_REQUEST, 'Only POST method allowed', 405);
   }
 
   let body: JsonRpcRequest;
   try {
     body = await request.json();
   } catch (error) {
-    return createErrorResponse(null, ErrorCode.PARSE_ERROR, `Invalid JSON: ${error instanceof Error ? error.message : 'Unknown error'}`, 400);
+    return createErrorResponse(null, ErrorCode.PARSE_ERROR, 'Invalid JSON', 400);
   }
 
-  // Validate JSON-RPC structure
   if (body.jsonrpc !== JSONRPC_VERSION) {
-    return createErrorResponse(body.id ?? null, ErrorCode.INVALID_REQUEST, `Invalid JSON-RPC version. Expected: ${JSONRPC_VERSION}`, 400);
+    return createErrorResponse(body.id ?? null, ErrorCode.INVALID_REQUEST, 'Invalid JSON-RPC version', 400);
   }
 
   if (!body.method || typeof body.method !== 'string') {
-    return createErrorResponse(body.id ?? null, ErrorCode.INVALID_REQUEST, 'Missing or invalid method field', 400);
+    return createErrorResponse(body.id ?? null, ErrorCode.INVALID_REQUEST, 'Missing method', 400);
   }
 
   const { method, params, id } = body;
@@ -689,35 +697,25 @@ async function handleMessages(request: Request, env: Env, user: UserSession): Pr
       case 'initialize':
         result = handleInitialize(params);
         break;
-
       case 'tools/list':
         result = { tools: TOOLS };
         break;
-
       case 'tools/call':
-        result = await handleToolCall(params, sessionId, env, user);
+        result = await handleToolCall(params, sessionId, env, clientId);
         break;
-
       case 'ping':
-        // Simple ping-pong for keepalive
         result = {};
         break;
-
       default:
         throw new McpError(ErrorCode.METHOD_NOT_FOUND, `Unknown method: ${method}`);
     }
 
-    // Only return response if id is present (not a notification)
     if (id !== undefined) {
       return createSuccessResponse(id, result);
     }
-    
-    // For notifications, return 202 Accepted with no body per JSON-RPC spec
     return new Response(null, { status: 202 });
-
   } catch (error) {
-    // Determine error code and message
-    let code: number = ErrorCode.INTERNAL_ERROR;
+    let code = ErrorCode.INTERNAL_ERROR;
     let message = 'Internal error';
 
     if (error instanceof McpError) {
@@ -727,12 +725,9 @@ async function handleMessages(request: Request, env: Env, user: UserSession): Pr
       message = error.message;
     }
 
-    // Only include id in error response if it was present in request
     if (id !== undefined) {
-      return createErrorResponse(id, code, message, 200); // JSON-RPC errors return 200 OK
+      return createErrorResponse(id, code, message, 200);
     }
-    
-    // Notification errors are not returned to client per spec
     return new Response(null, { status: 202 });
   }
 }
@@ -742,32 +737,20 @@ async function handleMessages(request: Request, env: Env, user: UserSession): Pr
  */
 function handleInitialize(params: any): any {
   const clientProtocolVersion = params?.protocolVersion;
-  
-  // Supported protocol versions (latest first)
   const supportedVersions = ['2025-11-25', '2025-06-18', '2024-11-05'];
-  
-  // Protocol version negotiation - use client version if supported, otherwise use latest
-  const protocolVersion = supportedVersions.includes(clientProtocolVersion) 
-    ? clientProtocolVersion 
-    : MCP_VERSION;
+  const protocolVersion = supportedVersions.includes(clientProtocolVersion) ? clientProtocolVersion : MCP_VERSION;
   
   return {
     protocolVersion,
-    capabilities: { 
-      tools: {},
-      logging: {}
-    },
-    serverInfo: { 
-      name: SERVER_NAME, 
-      version: SERVER_VERSION 
-    }
+    capabilities: { tools: {}, logging: {} },
+    serverInfo: { name: SERVER_NAME, version: SERVER_VERSION }
   };
 }
 
 /**
- * Handle tool call request
+ * Handle tool call
  */
-async function handleToolCall(params: any, sessionId: string, env: Env, user: UserSession): Promise<any> {
+async function handleToolCall(params: any, sessionId: string, env: Env, clientId: string): Promise<any> {
   const toolName = params?.name;
   
   if (toolName !== 'sequentialthinking') {
@@ -775,19 +758,13 @@ async function handleToolCall(params: any, sessionId: string, env: Env, user: Us
   }
 
   const args = params?.arguments ?? {};
-  
-  // Validate required parameters
   const required = ['thought', 'nextThoughtNeeded', 'thoughtNumber', 'totalThoughts', 'available_mcp_tools'];
   const missing = required.filter(field => !(field in args));
   
   if (missing.length > 0) {
-    throw new McpError(
-      ErrorCode.INVALID_TOOL_INPUT, 
-      `Missing required parameters: ${missing.join(', ')}`
-    );
+    throw new McpError(ErrorCode.INVALID_TOOL_INPUT, `Missing required parameters: ${missing.join(', ')}`);
   }
 
-  // Type validation
   if (typeof args.thought !== 'string') {
     throw new McpError(ErrorCode.INVALID_TOOL_INPUT, 'Parameter "thought" must be a string');
   }
@@ -801,58 +778,29 @@ async function handleToolCall(params: any, sessionId: string, env: Env, user: Us
     throw new McpError(ErrorCode.INVALID_TOOL_INPUT, 'Parameter "available_mcp_tools" must be an array');
   }
 
-  // Validate revision logic
-  if (args.isRevision && !args.revisesThought) {
-    throw new McpError(ErrorCode.INVALID_TOOL_INPUT, 'Parameter "revisesThought" is required when "isRevision" is true');
-  }
-
-  return await handleThinking(args, sessionId, env, user);
+  return await handleThinking(args, sessionId, env, clientId);
 }
 
 /**
- * Core thinking logic with KV persistence
+ * Core thinking logic
  */
-async function handleThinking(args: any, sessionId: string, env: Env, user: UserSession): Promise<any> {
-  // Validate sessionId to prevent injection
+async function handleThinking(args: any, sessionId: string, env: Env, clientId: string): Promise<any> {
   if (!/^[a-zA-Z0-9_-]+$/.test(sessionId)) {
     throw new McpError(ErrorCode.INVALID_PARAMS, 'Invalid sessionId format');
   }
 
-  // Include user ID in key for user isolation
-  const key = `session:${user.userId}:${sessionId}`;
+  const key = `thoughts:${clientId}:${sessionId}`;
   
-  // Retrieve existing thoughts from KV with error handling
   let thoughts: Thought[] = [];
-  try {
-    const existing = await env.THINKING_KV.get(key);
-    if (existing) {
-      try {
-        const parsed = JSON.parse(existing);
-        if (Array.isArray(parsed)) {
-          thoughts = parsed;
-        }
-      } catch (parseError) {
-        // Log but don't fail - start fresh if data is corrupted
-        console.error(`Failed to parse thoughts for session ${sessionId}:`, parseError);
-      }
-    }
-  } catch (kvError) {
-    console.error(`KV read error for session ${sessionId}:`, kvError);
-    throw new McpError(ErrorCode.INTERNAL_ERROR, 'Failed to retrieve session data');
+  const existing = await env.THINKING_KV.get(key);
+  if (existing) {
+    try {
+      thoughts = JSON.parse(existing);
+    } catch {}
   }
 
-  // Generate tool recommendations
-  const recommendations = generateRecommendations(
-    args.thought,
-    args.available_mcp_tools || [],
-    args.thoughtNumber,
-    args.totalThoughts
-  );
-
-  // Calculate adjusted total thoughts
-  const adjustedTotalThoughts = args.needsMoreThoughts 
-    ? args.totalThoughts + 1 
-    : args.totalThoughts;
+  const recommendations = generateRecommendations(args.thought, args.available_mcp_tools || [], args.thoughtNumber, args.totalThoughts);
+  const adjustedTotalThoughts = args.needsMoreThoughts ? args.totalThoughts + 1 : args.totalThoughts;
 
   const newThought: Thought = {
     thought: args.thought,
@@ -865,34 +813,24 @@ async function handleThinking(args: any, sessionId: string, env: Env, user: User
     branchId: args.branchId,
     needsMoreThoughts: args.needsMoreThoughts,
     toolRecommendations: recommendations,
-    timestamp: Date.now()
+    timestamp: Date.now(),
+    sessionId
   };
 
-  // Handle revision or addition
   if (args.isRevision && args.revisesThought) {
     const idx = thoughts.findIndex(t => t.thoughtNumber === args.revisesThought);
     if (idx !== -1) {
       thoughts[idx] = newThought;
     } else {
-      // If target thought not found, add as new but preserve revision metadata
       thoughts.push(newThought);
     }
   } else {
     thoughts.push(newThought);
   }
 
-  // Sort by thought number
   thoughts.sort((a, b) => a.thoughtNumber - b.thoughtNumber);
+  await env.THINKING_KV.put(key, JSON.stringify(thoughts), { expirationTtl: 3600 });
 
-  // Persist to KV with 1-hour TTL
-  try {
-    await env.THINKING_KV.put(key, JSON.stringify(thoughts), { expirationTtl: 3600 });
-  } catch (kvError) {
-    console.error(`KV write error for session ${sessionId}:`, kvError);
-    throw new McpError(ErrorCode.INTERNAL_ERROR, 'Failed to save session data');
-  }
-
-  // Format output
   let output = `## Thought ${args.thoughtNumber}/${adjustedTotalThoughts}`;
   if (args.isRevision) output += ' (Revision)';
   if (args.branchId) output += ` [Branch: ${args.branchId}]`;
@@ -906,49 +844,38 @@ async function handleThinking(args: any, sessionId: string, env: Env, user: User
     output += '\n';
   }
 
-  output += `---\nSession thoughts: ${thoughts.length}\nUser: ${user.username}`;
+  output += `---\nSession thoughts: ${thoughts.length}`;
 
-  return { 
-    content: [{ type: 'text', text: output }] 
-  };
+  return { content: [{ type: 'text', text: output }] };
 }
 
 /**
- * Generate tool recommendations based on thought content
+ * Generate tool recommendations
  */
-function generateRecommendations(
-  thought: string,
-  tools: string[],
-  thoughtNum: number,
-  totalThoughts: number
-): ToolRecommendation[] {
+function generateRecommendations(thought: string, tools: string[], thoughtNum: number, totalThoughts: number): ToolRecommendation[] {
   if (!tools.length) return [];
 
   const thoughtLower = thought.toLowerCase();
   const recs: ToolRecommendation[] = [];
 
-  // Pattern matching for tool categories
   const patterns: Record<string, string[]> = {
-    search: ['search', 'find', 'google', 'lookup', 'query', 'retrieve'],
-    browser: ['web', 'page', 'click', 'navigate', 'http', 'url', 'website', 'browse'],
-    file: ['file', 'read', 'write', 'folder', 'path', 'directory', 'save', 'load'],
-    git: ['git', 'commit', 'push', 'pull', 'branch', 'merge', 'repository', 'repo'],
-    api: ['api', 'endpoint', 'request', 'post', 'get', 'fetch', 'http', 'rest', 'graphql'],
-    code: ['code', 'function', 'class', 'variable', 'debug', 'error', 'syntax'],
-    db: ['database', 'sql', 'query', 'table', 'record', 'store', 'persist']
+    search: ['search', 'find', 'google', 'lookup', 'query'],
+    browser: ['web', 'page', 'click', 'navigate', 'url'],
+    file: ['file', 'read', 'write', 'folder', 'path'],
+    git: ['git', 'commit', 'push', 'pull', 'branch'],
+    api: ['api', 'endpoint', 'request', 'fetch'],
+    code: ['code', 'function', 'class', 'debug']
   };
 
   for (const tool of tools) {
     const toolLower = tool.toLowerCase();
     let confidence = 0;
 
-    // Direct name match (remove common prefixes)
     const toolBaseName = toolLower.replace(/^(mcp-|server-)/g, '');
     if (thoughtLower.includes(toolBaseName)) {
       confidence += 0.4;
     }
 
-    // Category pattern matching
     for (const [category, keywords] of Object.entries(patterns)) {
       if (toolLower.includes(category)) {
         const matches = keywords.filter(kw => thoughtLower.includes(kw));
@@ -956,21 +883,11 @@ function generateRecommendations(
       }
     }
 
-    // Context boost for early thoughts
-    if (thoughtNum === 1 && ['search', 'file', 'git'].some(x => toolLower.includes(x))) {
-      confidence += 0.15;
-    }
-
-    // Context boost for final thoughts
-    if (thoughtNum === totalThoughts && ['api', 'code', 'file'].some(x => toolLower.includes(x))) {
-      confidence += 0.1;
-    }
-
     if (confidence > 0.3) {
       recs.push({
         tool,
         confidence: Math.min(confidence, 0.95),
-        rationale: `Matches patterns in thought context`,
+        rationale: 'Matches patterns in thought context',
         priority: confidence > 0.7 ? 'high' : (confidence > 0.5 ? 'medium' : 'low')
       });
     }
@@ -983,61 +900,33 @@ function generateRecommendations(
  * Create JSON-RPC success response
  */
 function createSuccessResponse(id: string | number | null, result: any): Response {
-  const response: JsonRpcResponse = {
-    jsonrpc: JSONRPC_VERSION,
-    id,
-    result
-  };
-
-  return new Response(JSON.stringify(response), {
-    status: 200,
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*'
-    }
+  return new Response(JSON.stringify({ jsonrpc: JSONRPC_VERSION, id, result }), {
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
   });
 }
 
 /**
  * Create JSON-RPC error response
  */
-function createErrorResponse(
-  id: string | number | null | undefined, 
-  code: number, 
-  message: string, 
-  httpStatus: number = 200
-): Response {
+function createErrorResponse(id: string | number | null | undefined, code: number, message: string, httpStatus: number = 200): Response {
   const response: JsonRpcResponse = {
     jsonrpc: JSONRPC_VERSION,
-    error: {
-      code,
-      message
-    }
+    error: { code, message }
   };
-
-  // Only include id if it was provided (not undefined and not null from notification)
-  if (id !== undefined && id !== null) {
-    response.id = id;
-  } else if (id === null) {
-    // Explicit null id (invalid request) should include null id per JSON-RPC spec
-    response.id = null;
-  }
+  if (id !== undefined && id !== null) response.id = id;
+  else if (id === null) response.id = null;
 
   return new Response(JSON.stringify(response), {
     status: httpStatus,
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*'
-    }
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
   });
 }
 
 /**
- * MCP-specific error class for typed error handling
+ * MCP Error class
  */
 class McpError extends Error {
   code: number;
-
   constructor(code: number, message: string) {
     super(message);
     this.code = code;
