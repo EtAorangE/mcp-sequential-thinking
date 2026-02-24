@@ -254,6 +254,26 @@ export default {
 
     // JSON-RPC messages endpoint
     if (path === '/messages') {
+      // 克隆请求以便读取 body
+      const clonedRequest = request.clone();
+      let body: JsonRpcRequest;
+      try {
+        body = await clonedRequest.json() as JsonRpcRequest;
+      } catch {
+        return createErrorResponse(null, ErrorCode.PARSE_ERROR, 'Invalid JSON', 400);
+      }
+      
+      // 检查是否有 Authorization header
+      const authHeader = request.headers.get('Authorization');
+      
+      // 如果没有 Token，允许基本的 MCP 操作（initialize, tools/list）
+      if (!authHeader) {
+        if (body.method === 'initialize' || body.method === 'tools/list') {
+          return handleMessages(request, env, 'anonymous');
+        }
+        return createErrorResponse(null, ErrorCode.UNAUTHORIZED, 'Missing Authorization header', 401);
+      }
+      
       const authResult = await verifyAuth(request, env);
       if (!authResult.valid) {
         return createErrorResponse(null, ErrorCode.UNAUTHORIZED, authResult.error || 'Unauthorized', 401);
