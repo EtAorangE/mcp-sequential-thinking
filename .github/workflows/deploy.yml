@@ -13,12 +13,30 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
+      - name: Create wrangler.toml
+        run: |
+          cat > wrangler.toml << EOF
+          name = "mcp-sequential-thinking"
+          main = "index.ts"
+          compatibility_date = "2025-02-24"
+          compatibility_flags = ["nodejs_compat"]
+          
+          [[kv_namespaces]]
+          binding = "THINKING_KV"
+          id = "${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}"
+          
+          [vars]
+          OAUTH_ISSUER = "https://mcp-sequential-thinking.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev"
+          EOF
+      
       - name: Deploy to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy index.ts --name mcp-sequential-thinking --compatibility-date 2025-02-24 --compatibility-flag nodejs_compat --kv THINKING_KV=${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }} --var OAUTH_ISSUER:https://mcp-sequential-thinking.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev --var JWT_SECRET:${{ secrets.JWT_SECRET }}
+          secrets: JWT_SECRET
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
       
       - name: Verify deployment
         run: |
