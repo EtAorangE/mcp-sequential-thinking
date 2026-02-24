@@ -18,7 +18,7 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy index.ts --name mcp-sequential-thinking --compatibility-date 2025-02-24 --compatibility-flag nodejs_compat --var OAUTH_ISSUER:https://mcp-sequential-thinking.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev --var JWT_SECRET:mcp-default-jwt-secret-2025
+          command: deploy index.ts --name mcp-sequential-thinking --compatibility-date 2025-02-24 --compatibility-flag nodejs_compat --kv THINKING_KV=${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }} --var OAUTH_ISSUER:https://mcp-sequential-thinking.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev --var JWT_SECRET:mcp-default-jwt-secret-2025
       
       - name: Verify deployment
         run: |
