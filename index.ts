@@ -346,39 +346,47 @@ async function handleClientRegistration(request: Request, env: Env): Promise<Res
     });
   }
 
-  // Generate client credentials
-  const clientId = crypto.randomUUID();
-  const clientSecret = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
-  
-  const client: OAuthClient = {
-    client_id: clientId,
-    client_secret: clientSecret,
-    redirect_uris: body.redirect_uris || [],
-    client_name: body.client_name || 'MCP Client',
-    grant_types: body.grant_types || ['authorization_code', 'client_credentials'],
-    response_types: body.response_types || ['code'],
-    scope: body.scope || SCOPES.join(' ')
-  };
+  try {
+    // Generate client credentials
+    const clientId = crypto.randomUUID();
+    const clientSecret = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
+    
+    const client: OAuthClient = {
+      client_id: clientId,
+      client_secret: clientSecret,
+      redirect_uris: body.redirect_uris || [],
+      client_name: body.client_name || 'MCP Client',
+      grant_types: body.grant_types || ['authorization_code', 'client_credentials'],
+      response_types: body.response_types || ['code'],
+      scope: body.scope || SCOPES.join(' ')
+    };
 
-  // Store client in KV
-  await kvPut(env, `oauth:client:${clientId}`, JSON.stringify(client), { expirationTtl: 86400 * 365 });
+    // Store client in KV
+    await kvPut(env, `oauth:client:${clientId}`, JSON.stringify(client), { expirationTtl: 86400 * 365 });
 
-  const response = {
-    client_id: client.client_id,
-    client_secret: client.client_secret,
-    client_id_issued_at: Math.floor(Date.now() / 1000),
-    client_secret_expires_at: 0, // Never expires
-    redirect_uris: client.redirect_uris,
-    client_name: client.client_name,
-    grant_types: client.grant_types,
-    response_types: client.response_types,
-    scope: client.scope
-  };
+    const response = {
+      client_id: client.client_id,
+      client_secret: client.client_secret,
+      client_id_issued_at: Math.floor(Date.now() / 1000),
+      client_secret_expires_at: 0, // Never expires
+      redirect_uris: client.redirect_uris,
+      client_name: client.client_name,
+      grant_types: client.grant_types,
+      response_types: client.response_types,
+      scope: client.scope
+    };
 
-  return new Response(JSON.stringify(response), {
-    status: 201,
-    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-  });
+    return new Response(JSON.stringify(response), {
+      status: 201,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return new Response(JSON.stringify({ error: 'server_error', error_description: message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
 }
 
 /**
